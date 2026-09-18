@@ -1,0 +1,7 @@
+# 用哪个 provider 就装哪个：两个都装也没问题，方便随时切换对比。
+langchain-core>=0.3
+langchain-openai>=0.3
+langchain-deepseek>=0.1
+langgraph>=0.2
+pydantic>=2.7
+openai>=1.50
