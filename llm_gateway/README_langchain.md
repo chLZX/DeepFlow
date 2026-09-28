@@ -223,3 +223,54 @@ curl http://127.0.0.1:8000/v1/traces
 ```
 
 **验证降级效果**：把 `DEEPSEEK_API_KEY` 改成一个无效值再发请求，响应里的 `model` 字段应该会变成 `"general-backup"`，并且会收到 `401 invalid_api_key`（如果备用模型的 Key 也失效）或正常结果（如果备用模型的 Key 有效）。
+
+---
+
+## 九、`field_validator` / `model_validator` 的作用，以及为什么要做 stream/response_schema 互斥校验
+
+```python
+class LLMRequest(BaseModel):
+    model: str
+    messages: list[Message]
+    stream: bool = False
+    response_schema: dict[str, Any] | None = None
+    timeout_seconds: float = Field(default=30, gt=0, le=120)
+    prompt_name: str | None = None
+    prompt_variables: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def check_supported_combination(self) -> "LLMRequest":
+        if self.stream and self.response_schema is not None:
+            raise ValueError("stream 与 response_schema 不能同时使用")
+        return self
+```
+
+### `field_validator` 和 `model_validator` 的区别
+
+Pydantic v2 里有两种校验器，管的范围不一样：
+
+| | 校验对象 | 能不能看到别的字段 | 典型用途 |
+|---|---|---|---|
+| `@field_validator("字段名")` | **单个字段** | 不能——只能拿到这一个字段的值 | 单字段格式校验/清洗，比如邮箱必须带 `@`、字符串去空格 |
+| `@model_validator(mode=...)` | **整个模型实例** | 能——`self` 上所有字段都能同时访问 | **跨字段**的联合校验，比如"字段 A 和字段 B 不能同时为真" |
+
+`stream` 和 `response_schema` 是不是冲突，**必须同时看这两个字段的值才能判断**——单独看 `stream` 或者单独看 `response_schema`，都得不出"这俩不能共存"的结论。所以这里只能用 `model_validator`，`field_validator` 天生做不了这种跨字段判断。
+
+`model_validator` 还分 `mode="before"`（在字段解析/类型转换**之前**跑，拿到的是原始 dict，常用于数据预处理）和 `mode="after"`（在所有字段都解析、转换、单字段校验完**之后**跑，`self` 已经是成型的实例，可以直接用 `self.stream`、`self.response_schema` 这种属性访问）。这里用 `mode="after"`，因为要读的是"已经确定类型的字段值"（`stream` 已经是 bool，`response_schema` 已经是 `dict | None`），必须等字段都解析完才能做逻辑判断。
+
+### 为什么偏偏要挡住 `stream` + `response_schema` 这个组合
+
+这不是随意加的限制，是因为这两个功能的语义**根本没法同时兑现**：
+
+- **`response_schema` 隐含的承诺**：网关保证最终给你的是一个**完整的、经过校验合规**的 JSON 结果。
+- **`stream` 隐含的承诺**：内容**还没生成完**，网关就已经开始把片段发给你了。
+
+假设模型正在生成 `{"answer": "你好", "confidence": 0.9}`，开了流式之后，网关会一小块一小块往外发，比如第一块是 `{"ans`。这一小块单独拿出来根本不是合法 JSON，`json.loads('{"ans')` 直接报错——**没法在流式过程中做 schema 校验，只能等全部内容收完才能校验一次**。
+
+而"等全部内容收完再校验"这件事本身就晚了：在等待收完的这段时间里，网关早就已经把 `{"ans`、`wer": "你`、`好", "conf`、`idence": 0.9}` 这几块内容通过 SSE 实时发给调用方了。如果最后校验发现内容不合规（比如漏了 `confidence` 字段），网关这时候什么都做不了：
+- 不能说"作废重来"——内容已经发出去了，调用方可能已经在界面上看到了这些文字，没法收回。
+- 不能"换个模型重新生成再发一遍"——`with_fallbacks` 只在"还没开始发送内容"之前才能安全切换模型，一旦已经发出去内容，切换模型会导致文本重复或语义断裂（这一点在第三节讲 `with_fallbacks` 时也提到过）。
+
+所以与其允许这种组合、然后在真出问题时陷入"没法挽回"的境地，不如在请求刚进来的校验阶段就直接拒绝，让调用方自己二选一：要么要流式体验、放弃结构化保证；要么要结构化保证、放弃流式体验。这正是 `check_supported_combination` 这个 `model_validator` 存在的意义——**它拦的不是"格式错误"，而是"两个功能本身互相矛盾，不管怎么实现都没法两全"**。
+
+> 补充：更完整的生产级网关（比如 `1-7` 那个项目）并没有完全禁止这个组合，而是允许你这么做，但在文档里明确警告"流式输出无法在已经发送内容后进行无损纠错，严格业务场景建议用非流式接口"——本质上是把这里我们直接拒绝的风险，换成了"允许你用，但责任自负"。我们这份简化版选择了更保守的做法：直接在请求校验阶段拒绝，因为这份代码里的结构化输出校验失败后没有任何补救手段（直接 502 报错），干脆不让这种组合发生，比让调用方自己撞上这个坑更省心。
